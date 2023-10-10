@@ -22,13 +22,21 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributed import _functional_collectives as collectives
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.distributed.fsdp import (
+    FullyShardedDataParallel as FSDP,
+    MixedPrecision,
+)
 import torchbenchmark
 import subprocess
+import functools
+from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
 
 from torchbench import TorchBenchmarkRunner
 from common import parse_args, patch_torch_manual_seed, cast_to_fp16
 
 def cleanup():
+    torch.cuda.synchronize()
+
     # kill any running processes using gpu
     output = subprocess.run(
         ["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader,nounits"],
@@ -166,13 +174,45 @@ def run_one_rank(
     runner.model_iter_fn = runner.forward_and_backward_pass
 
     def run_eager():
-        model_eager = DDP(
-            model,
-            device_ids=[my_rank],
-            output_device=my_rank,
-            # bucket_cap_mb=25,  # DDP default value
-        )
+        if args.ddp:
+            model_eager = DDP(
+                model,
+                device_ids=[my_rank],
+                output_device=my_rank,
+                # bucket_cap_mb=25,  # DDP default value
+            )
+        elif args.fsdp:
+            if args.float16:
+                dtype = torch.float16
+            elif args.bfloat16:
+                dtype = torch.bfloat16
+            else:
+                dtype = torch.float32
+            print(f"FSDP with dtype={dtype}")
 
+            mp_policy = MixedPrecision(
+                param_dtype=dtype,
+                # Gradient communication precision.
+                reduce_dtype=dtype,
+                # Buffer precision.
+                buffer_dtype=dtype,
+            )
+
+            my_auto_wrap_policy = functools.partial(
+                size_based_auto_wrap_policy, recurse=True,
+                min_num_params=int(1)
+            )
+
+            model_eager = FSDP(
+                model,
+                use_orig_params=True,
+                device_id=torch.cuda.current_device(),
+                mixed_precision=mp_policy,
+                limit_all_gathers=True,
+                auto_wrap_policy=my_auto_wrap_policy,
+            )
+            if torch._inductor.config.triton.cudagraphs:
+                torch._inductor.config.triton.cudagraphs = False
 
         eager_times, f_gb = bench(
             lambda: runner.model_iter_fn(model_eager, example_inputs, collect_outputs=False),
@@ -191,12 +231,44 @@ def run_one_rank(
         if not args.disable_cudagraphs:
             torch.profiler._utils._init_for_cuda_graphs()
 
-        model_compiled = DDP(
-            torch.compile(model, mode="reduce-overhead"),
-            device_ids=[my_rank],
-            output_device=my_rank,
-            bucket_cap_mb=args.ddp_bucket_cap_mb_for_compiled
-        )
+        if args.ddp:
+            model_compiled = DDP(
+                torch.compile(model, mode="reduce-overhead"),
+                device_ids=[my_rank],
+                output_device=my_rank,
+                bucket_cap_mb=args.ddp_bucket_cap_mb_for_compiled
+            )
+        elif args.fsdp:
+            if args.float16:
+                dtype = torch.float16
+            elif args.bfloat16:
+                dtype = torch.bfloat16
+            else:
+                dtype = torch.float32
+
+            mp_policy = MixedPrecision(
+                param_dtype=dtype,
+                # Gradient communication precision.
+                reduce_dtype=dtype,
+                # Buffer precision.
+                buffer_dtype=dtype,
+            )
+
+            my_auto_wrap_policy = functools.partial(
+                size_based_auto_wrap_policy, recurse=True,
+                min_num_params=int(1)
+            )
+
+            model_compiled = FSDP(
+                torch.compile(model),
+                use_orig_params=True,
+                device_id=torch.cuda.current_device(),
+                mixed_precision=mp_policy,
+                limit_all_gathers=True,
+                auto_wrap_policy=my_auto_wrap_policy,
+            )
+            if torch._inductor.config.triton.cudagraphs:
+                torch._inductor.config.triton.cudagraphs = False
 
         compiled_times, g_gb = bench(
             lambda: runner.model_iter_fn(model_compiled, example_inputs),
