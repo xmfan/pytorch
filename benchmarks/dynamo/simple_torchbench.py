@@ -11,7 +11,10 @@ PYTHONPATH=/fsx/users/willfeng2/benchmark:$PYTHONPATH HUGGING_FACE_HUB_TOKEN=hf_
 import argparse
 import contextlib
 
+import time
 import os
+import io
+import sys
 from typing import List, Optional, Tuple
 
 import torch
@@ -35,8 +38,6 @@ from torchbench import TorchBenchmarkRunner
 from common import parse_args, patch_torch_manual_seed, cast_to_fp16
 
 def cleanup():
-    torch.cuda.synchronize()
-
     # kill any running processes using gpu
     output = subprocess.run(
         ["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader,nounits"],
@@ -51,6 +52,7 @@ def cleanup():
 
     process_id_strs = [pid for pid in output.stdout.strip().split("\n")]
 
+    print(f"Terminating processes={process_id_strs}", file=sys.stderr)
     for pid in process_id_strs:
         subprocess.run(
             ["kill", pid],
@@ -73,10 +75,11 @@ def bench(
     assert device is not None
 
     dynamo_config.suppress_errors = False
+    dynamo_config.cache_size_limit = 1
 
     f_ = iter_func
 
-    repeat = 5
+    repeat = 1
     f = lambda: [(f_(), torch.cuda.synchronize()) for _ in range(repeat)]
     import time
 
@@ -118,7 +121,8 @@ def run_one_rank(
     my_rank,
     args,
     runner,
-    compile
+    compile,
+    pipe, 
 ):
     global print
     if my_rank != 0:
@@ -182,13 +186,7 @@ def run_one_rank(
                 # bucket_cap_mb=25,  # DDP default value
             )
         elif args.fsdp:
-            if args.float16:
-                dtype = torch.float16
-            elif args.bfloat16:
-                dtype = torch.bfloat16
-            else:
-                dtype = torch.float32
-            print(f"FSDP with dtype={dtype}")
+            dtype = torch.float16
 
             mp_policy = MixedPrecision(
                 param_dtype=dtype,
@@ -223,6 +221,17 @@ def run_one_rank(
 
         assert len(eager_times) == 8
         print(f"eager    : {(sum(eager_times) / len(eager_times) * 1000):.3f} ms \t{f_gb} GB")
+        if pipe is not None:
+            pipe_msg = [
+                "eager",
+                str((sum(eager_times)/len(eager_times)*1000)),
+                str(f_gb),
+                "",
+                "",
+            ] 
+            pipe_msg_str = ",".join(pipe_msg)
+            print(f"passing back to __main__: {pipe_msg_str}")
+            pipe.send(pipe_msg_str)
 
     def run_compile():
         # NOTE: throws `daemonic processes are not allowed to have children` error at `AsyncCompile.warm_pool() -> pool._adjust_process_count()` if we don't set this to 1.
@@ -232,12 +241,23 @@ def run_one_rank(
             torch.profiler._utils._init_for_cuda_graphs()
 
         if args.ddp:
+            torch.cuda.synchronize()
+            t0 = time.time()
+            m = torch.compile(model, mode="reduce-overhead")
+            m
+            torch.cuda.synchronize()
+            t1 = time.time()
+            print(f"Compiled model in {(t1-t0)*1000:.3f} ms")
             model_compiled = DDP(
-                torch.compile(model, mode="reduce-overhead"),
+                m,
                 device_ids=[my_rank],
                 output_device=my_rank,
                 bucket_cap_mb=args.ddp_bucket_cap_mb_for_compiled
             )
+            model_compiled
+            torch.cuda.synchronize()
+            t2 = time.time()
+            print(f"Wrapped model in {(t2-t1)*1000:.3f} ms")
         elif args.fsdp:
             if args.float16:
                 dtype = torch.float16
@@ -259,17 +279,33 @@ def run_one_rank(
                 min_num_params=int(1)
             )
 
+            torch.cuda.synchronize()
+            t0 = time.time()
+            m = torch.compile(model)
+            m
+            torch.cuda.synchronize()
+            t1 = time.time()
+            print(f"Compiled model in {(t1-t0)*1000:.3f} ms")
             model_compiled = FSDP(
-                torch.compile(model),
+                m,
                 use_orig_params=True,
                 device_id=torch.cuda.current_device(),
                 mixed_precision=mp_policy,
                 limit_all_gathers=True,
                 auto_wrap_policy=my_auto_wrap_policy,
             )
+            model_compiled
+            torch.cuda.synchronize()
+            t2 = time.time() 
+            print(f"Wrapped model in {(t2-t1)*1000:.3f} ms")
+
             if torch._inductor.config.triton.cudagraphs:
                 torch._inductor.config.triton.cudagraphs = False
 
+        model_compile_time = (t1-t0)*1000
+        model_wrap_time = (t2-t1)*1000
+
+        print("Running bench")
         compiled_times, g_gb = bench(
             lambda: runner.model_iter_fn(model_compiled, example_inputs),
             profile=args.export_profiler_trace,
@@ -279,6 +315,17 @@ def run_one_rank(
 
         assert len(compiled_times) == 8
         print(f"compiled : {(sum(compiled_times) / len(compiled_times) * 1000):.3f} ms \t{g_gb} GB")
+        if pipe is not None:
+            pipe_msg = [
+                "compiled",
+                str(sum(compiled_times)/len(compiled_times)*1000),
+                str(g_gb),
+                str(model_compile_time),
+                str(model_wrap_time),
+            ]
+            pipe_msg_str = ",".join(pipe_msg)
+            print(f"passing back to __main__: {pipe_msg_str}")
+            pipe.send(pipe_msg_str)
 
     run_compile() if compile else run_eager()
 
@@ -292,16 +339,17 @@ def run_one_rank(
     # print("done!")
 
 
-def main(compile: bool):
+def main(args, compile: bool):
     # parser = argparse.ArgumentParser()
     # parser.add_argument("--world-size", type=int, default=8)
-    args = parse_args()
     args.world_size = 8
 
     runner = TorchBenchmarkRunner()
     runner.args = args
 
     processes = []
+    from multiprocessing import Pipe
+    parent_conn, child_conn = Pipe()
     for rank in range(args.world_size):
         p = torch.multiprocessing.get_context("spawn").Process(
             target=run_one_rank,
@@ -309,7 +357,8 @@ def main(compile: bool):
                 rank,
                 args,
                 runner,
-                compile
+                compile,
+                child_conn if rank == 0 else None,
             ),
             daemon=True,
         )
@@ -319,8 +368,35 @@ def main(compile: bool):
     for rank, p in enumerate(processes):
         p.join()
 
+    # pass back to __main__
+    print(parent_conn.recv())
+
     cleanup()
 
 if __name__ == "__main__":
-    main(compile=False)
-    main(compile=True)
+    args = parse_args()
+    assert(args.ddp or args.fsdp)
+
+    from contextlib import redirect_stdout
+    with redirect_stdout(io.StringIO()) as f:
+        main(args, compile=False)
+        main(args, compile=True)
+
+    lines = f.getvalue().splitlines()
+    assert len(lines) == 2
+    eager_mode, eager_runtime, eager_peak_memory, _1, _2 = lines[0].split(',')
+    compiled_mode, compiled_runtime, compiled_peak_memory, compile_time, wrap_time = lines[1].split(',')
+    assert eager_mode == "eager"
+    assert compiled_mode == "compiled"
+
+    speedup = float(eager_runtime) / float(compiled_runtime)
+    print()
+    print(f"Stats for {args.only} {'DDP' if args.ddp else 'FSDP'} bs={args.batch_size}")
+    print(f"\tspeedup: {speedup:.3f}x")
+    print(f"\teager runtime: {float(eager_runtime):.3f} ms")
+    print(f"\teager peak memory: {float(eager_peak_memory):.3f} GB")
+    print()
+    print(f"\tcompiled runtime: {float(compiled_runtime):.3f} ms")
+    print(f"\tmodel compile time: {float(compile_time):.3f} ms")
+    print(f"\tmodel wrap time: {float(wrap_time):.3f} ms")
+    print(f"\tcompiled peak memory: {float(compiled_peak_memory):.3f} GB")
