@@ -116,6 +116,67 @@ def bench(
 
     return f_times, f_gb
 
+def wrap_ddp(m, my_rank, bucket_cap_mb=25):
+    return DDP(
+        m,
+        device_ids=[my_rank],
+        output_device=my_rank,
+        bucket_cap_mb=bucket_cap_mb
+    )
+
+def wrap_fsdp(m, args):
+    dtype = torch.float16
+
+    mp_policy = MixedPrecision(
+        param_dtype=dtype,
+        # Gradient communication precision.
+        reduce_dtype=dtype,
+        # Buffer precision.
+        buffer_dtype=dtype,
+    )
+
+    def size_based():
+        # from diffusers.models.unet_2d_blocks import UNetMidBlock2DCrossAttn
+        my_auto_wrap_policy = functools.partial(
+            size_based_auto_wrap_policy,
+            recurse=True,
+            min_num_params=int(1e9),
+            # exclude_wrap_modules={nn.ModuleList, nn.ModuleDict, UNetMidBlock2DCrossAttn, nn.Conv2d, nn.Embedding}
+        )
+        return my_auto_wrap_policy 
+
+    def name_based():
+        from transformers.models.t5.modeling_t5 import T5Block
+        from transformers.models.whisper.modeling_whisper import WhisperEncoderLayer
+        from transformers.models.llama.modeling_llama import LlamaDecoderLayer
+        from diffusers.models.transformer_2d import Transformer2DModel
+
+        from torchbenchmark.models.nanogpt.model import Block
+
+        from torch.distributed.fsdp.wrap import ModuleWrapPolicy
+
+        MODEL_FSDP_WRAP = {
+            "stable_diffusion_unet": (Transformer2DModel,),
+            "hf_T5": (T5Block,),
+            "hf_T5_base": (T5Block,),
+            "hf_T5_large": (T5Block,),
+            "hf_Whisper": (WhisperEncoderLayer,),
+            "llama_v2_7b_16h": (LlamaDecoderLayer,),
+            "nanogpt": (Block,),
+            "sam": (),
+        }
+        blocks = MODEL_FSDP_WRAP[args.only]
+        return ModuleWrapPolicy(blocks)
+
+    return FSDP(
+        m,
+        use_orig_params=True,
+        device_id=torch.cuda.current_device(),
+        mixed_precision=mp_policy,
+        limit_all_gathers=True,
+        auto_wrap_policy=name_based(),
+    )
+
 
 def run_one_rank(
     my_rank,
@@ -179,36 +240,12 @@ def run_one_rank(
 
     def run_eager():
         if args.ddp:
-            model_eager = DDP(
+            model_eager = wrap_ddp(
                 model,
-                device_ids=[my_rank],
-                output_device=my_rank,
-                # bucket_cap_mb=25,  # DDP default value
+                my_rank,
             )
         elif args.fsdp:
-            dtype = torch.float16
-
-            mp_policy = MixedPrecision(
-                param_dtype=dtype,
-                # Gradient communication precision.
-                reduce_dtype=dtype,
-                # Buffer precision.
-                buffer_dtype=dtype,
-            )
-
-            my_auto_wrap_policy = functools.partial(
-                size_based_auto_wrap_policy, recurse=True,
-                min_num_params=int(1)
-            )
-
-            model_eager = FSDP(
-                model,
-                use_orig_params=True,
-                device_id=torch.cuda.current_device(),
-                mixed_precision=mp_policy,
-                limit_all_gathers=True,
-                auto_wrap_policy=my_auto_wrap_policy,
-            )
+            model_eager = wrap_fsdp(model, args)
             if torch._inductor.config.triton.cudagraphs:
                 torch._inductor.config.triton.cudagraphs = False
 
@@ -248,37 +285,16 @@ def run_one_rank(
             torch.cuda.synchronize()
             t1 = time.time()
             print(f"Compiled model in {(t1-t0)*1000:.3f} ms")
-            model_compiled = DDP(
+            model_compiled = wrap_ddp(
                 m,
-                device_ids=[my_rank],
-                output_device=my_rank,
-                bucket_cap_mb=args.ddp_bucket_cap_mb_for_compiled
+                my_rank,
+                args.ddp_bucket_cap_mb_for_compiled
             )
             model_compiled
             torch.cuda.synchronize()
             t2 = time.time()
             print(f"Wrapped model in {(t2-t1)*1000:.3f} ms")
         elif args.fsdp:
-            if args.float16:
-                dtype = torch.float16
-            elif args.bfloat16:
-                dtype = torch.bfloat16
-            else:
-                dtype = torch.float32
-
-            mp_policy = MixedPrecision(
-                param_dtype=dtype,
-                # Gradient communication precision.
-                reduce_dtype=dtype,
-                # Buffer precision.
-                buffer_dtype=dtype,
-            )
-
-            my_auto_wrap_policy = functools.partial(
-                size_based_auto_wrap_policy, recurse=True,
-                min_num_params=int(1)
-            )
-
             torch.cuda.synchronize()
             t0 = time.time()
             m = torch.compile(model)
@@ -286,14 +302,7 @@ def run_one_rank(
             torch.cuda.synchronize()
             t1 = time.time()
             print(f"Compiled model in {(t1-t0)*1000:.3f} ms")
-            model_compiled = FSDP(
-                m,
-                use_orig_params=True,
-                device_id=torch.cuda.current_device(),
-                mixed_precision=mp_policy,
-                limit_all_gathers=True,
-                auto_wrap_policy=my_auto_wrap_policy,
-            )
+            model_compiled = wrap_fsdp(m, args) 
             model_compiled
             torch.cuda.synchronize()
             t2 = time.time() 
